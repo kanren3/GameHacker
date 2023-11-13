@@ -1,95 +1,71 @@
 #include <jni.h>
 #include <string>
 #include <sstream>
-#include <unordered_map>
+#include <fstream>
+#include <filesystem>
 #include <dobby.h>
 #include <unwind.h>
 #include <dlfcn.h>
 #include "utils.h"
 
-_Unwind_Reason_Code unwind_callback(_Unwind_Context *context, void *data)
+std::string (*org_onGetStringFromFile)(void *a1, void *path);
+std::string fake_onGetStringFromFile(void *a1, std::string *path)
 {
-    Dl_info info;
-    std::string filename;
-    uint32_t *counter;
+    std::string result = org_onGetStringFromFile(a1, path);
 
-    if (nullptr == context) {
-        return _URC_END_OF_STACK;
-    }
+    if (!result.empty()) {
+        std::string js_name = *path;
+        std::string js_path = *path;
 
-    _Unwind_Word pc = _Unwind_GetIP(context);
-
-    if (0 == pc) {
-        return _URC_END_OF_STACK;
-    }
-
-    counter = (uint32_t *)data;
-
-    if (*counter == 5) {
-        return _URC_END_OF_STACK;
-    }
-
-    *counter += 1;
-
-    if (dladdr((void *)pc, &info)) {
-        filename = info.dli_fname;
-
-        if (std::string::npos != filename.rfind('/')) {
-            filename = filename.substr(filename.rfind('/') + 1);
+        if (std::string::npos != js_name.rfind('/')) {
+            js_name = js_name.substr(js_name.rfind('/') + 1);
+            js_path = js_path.substr(0, js_path.rfind('/') + 1);
+        }
+        else{
+            js_path.clear();
         }
 
-        DEBUG_LOG("stack walk:%s+0x%p", filename.c_str(), (void*)(pc - (uintptr_t)info.dli_fbase));
-    }
+        try {
+            std::string export_path = std::string("/data/data/com.tencent.game.rhythmmaster/files/js_export/") + js_path;
 
-    return _URC_NO_REASON;
-}
+            if (!std::__fs::filesystem::exists(export_path) ||
+                std::__fs::filesystem::is_directory(export_path)) {
+                std::__fs::filesystem::create_directories(export_path);
+            }
 
-std::unordered_map<FILE *, std::string> file_logger;
+            export_path += js_name;
 
-FILE *(*org_fopen)(const char *filepath, const char *modes);
-FILE *fake_fopen(const char *filepath, const char *modes)
-{
-    FILE *result = org_fopen(filepath, modes);
+            std::ofstream ostream(export_path, std::ios::binary);
 
-    if (nullptr != result) {
-        std::string filepath_string = filepath;
-        file_logger.insert({ result, filepath_string});
-    }
+            if (ostream.is_open()) {
+                ostream.write(result.data(), (std::streamsize)result.size());
+                ostream.close();
+            }
+            DEBUG_LOG("export js succeed:%s", path->c_str());
+        }
+        catch (const std::exception& e) {
+            DEBUG_LOG("export js failed:%s", path->c_str());
+        }
 
-    return result;
-}
+        std::string js_data;
 
-int (*org_fclose)(FILE *fp);
-int fake_fclose(FILE *fp)
-{
-    int result;
+        std::string import_path = std::string("/data/data/com.tencent.game.rhythmmaster/files/js_import/") + js_path + js_name;
+        std::ifstream istream(import_path);
 
-    result = org_fclose(fp);
+        if (istream.is_open()) {
+            js_data.assign(std::istreambuf_iterator<char>(istream), std::istreambuf_iterator<char>());
+            istream.close();
 
-    if (0 == result) {
-        file_logger.erase(fp);
-    }
-
-    return result;
-}
-
-size_t (*org_fread)(void *ptr, size_t size, size_t nmemb, FILE *stream);
-size_t fake_fread(void *ptr, size_t size, size_t nmemb, FILE *stream)
-{
-    size_t result;
-
-    result = org_fread(ptr, size, nmemb, stream);
-
-    std::string file_path = file_logger[stream];
-
-    if (!file_path.empty()) {
-        if (file_path.find(".zip") != std::string::npos) {
-            DEBUG_LOG("fread:%s", file_path.c_str());
-
-            DEBUG_LOG("=============stack walk start=============");
-            uint32_t counter = 0;
-            _Unwind_Backtrace(unwind_callback, &counter);
-            DEBUG_LOG("=============stack walk end=============");
+            if (!js_data.empty()) {
+                DEBUG_LOG("import js:%s", import_path.c_str());
+                return js_data;
+            }
+            else {
+                return result;
+            }
+        }
+        else {
+            return result;
         }
     }
 
@@ -106,25 +82,23 @@ void *fake_android_dlopen_ext(const char *filepath, int flags, void *extinfo) {
         if (std::string::npos != filename.rfind('/')) {
             filename = filename.substr(filename.rfind('/') + 1);
         }
+
+        if (filename == "libcocos2djs.so") {
+            uintptr_t libcocos2djs_base = get_module_from_name("libcocos2djs.so");
+            uintptr_t onGetStringFromFile_address = libcocos2djs_base + 0x88F1C8;
+            DEBUG_LOG("onGetStringFromFile_address:%p", (void *)onGetStringFromFile_address);
+            DobbyHook((void *)onGetStringFromFile_address, (dobby_dummy_func_t)fake_onGetStringFromFile, (dobby_dummy_func_t *)&org_onGetStringFromFile);
+        }
     }
 
     return result;
 }
 
 jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
-//    void *android_dlopen_ext_address = DobbySymbolResolver(nullptr, "android_dlopen_ext");
-//    DobbyHook(android_dlopen_ext_address, (dobby_dummy_func_t)fake_android_dlopen_ext, (dobby_dummy_func_t*)&org_android_dlopen_ext);
-
     DEBUG_LOG("Hello!");
 
-    void *fopen_address = DobbySymbolResolver(nullptr, "fopen");
-    DobbyHook(fopen_address, (dobby_dummy_func_t)fake_fopen, (dobby_dummy_func_t*)&org_fopen);
-
-    void *fclose_address = DobbySymbolResolver(nullptr, "fclose");
-    DobbyHook(fclose_address, (dobby_dummy_func_t)fake_fclose, (dobby_dummy_func_t*)&org_fclose);
-
-    void *fread_address = DobbySymbolResolver(nullptr, "fread");
-    DobbyHook((void*)fread_address, (dobby_dummy_func_t)fake_fread, (dobby_dummy_func_t*)&org_fread);
+    void *android_dlopen_ext_address = DobbySymbolResolver(nullptr, "android_dlopen_ext");
+    DobbyHook(android_dlopen_ext_address, (dobby_dummy_func_t)fake_android_dlopen_ext, (dobby_dummy_func_t*)&org_android_dlopen_ext);
 
     return JNI_VERSION_1_6;
 }
